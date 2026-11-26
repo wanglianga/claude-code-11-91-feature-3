@@ -14,7 +14,11 @@ from sqlalchemy import (
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 from .enums import (
+    AllocationPolicy,
     MaintenanceKind,
+    OpsCaseKind,
+    OpsCaseStatus,
+    PowerReportKind,
     ReservationMode,
     ReservationStatus,
     ServiceActionKind,
@@ -43,6 +47,17 @@ class Site(Base):
     id: Mapped[int] = mapped_column(primary_key=True)
     name: Mapped[str] = mapped_column(String(64))
     location: Mapped[str] = mapped_column(String(128))
+    # 站点配电变压器总有功上限（kW）：站点级功率预算的硬顶，
+    # 不能把各枪口额定功率相加当成站点余量。
+    transformer_limit_kw: Mapped[float] = mapped_column(
+        Numeric(8, 2), default=180, server_default="180"
+    )
+    # 该站点采用的预算分配方式（可由运营端切换/回放）
+    allocation_policy: Mapped[AllocationPolicy] = mapped_column(
+        Enum(AllocationPolicy),
+        default=AllocationPolicy.GUARANTEED_MIN,
+        server_default=AllocationPolicy.GUARANTEED_MIN.value,
+    )
 
     connectors: Mapped[list["Connector"]] = relationship(
         back_populates="site", cascade="all, delete-orphan"
@@ -106,6 +121,28 @@ class Reservation(Base):
     start_at: Mapped[datetime] = mapped_column(DateTime)
     end_at: Mapped[datetime] = mapped_column(DateTime)
     min_power_kw: Mapped[float] = mapped_column(Numeric(6, 2))
+    # 期望（希望达到）功率：RESERVE_EXPECTED 策略按它整段预留，如 R1/R2/R3 希望 90kW
+    expected_power_kw: Mapped[float] = mapped_column(
+        Numeric(6, 2), default=90, server_default="90"
+    )
+    # 确认时实际采用的分配策略快照（站点策略之后切换不影响已确认订单的解释口径）
+    allocation_policy: Mapped[AllocationPolicy] = mapped_column(
+        Enum(AllocationPolicy),
+        default=AllocationPolicy.GUARANTEED_MIN,
+        server_default=AllocationPolicy.GUARANTEED_MIN.value,
+    )
+    # 调度器当前分配给该会话的功率（kW）；未开始调度前为空
+    allocated_power_kw: Mapped[float | None] = mapped_column(
+        Numeric(6, 2), nullable=True
+    )
+    # 车辆最近一次回报的“当前可接受/可用功率”（BMS 上限）
+    current_available_power_kw: Mapped[float | None] = mapped_column(
+        Numeric(6, 2), nullable=True
+    )
+    # 车辆是否处于电池限功率（BMS 降额）状态
+    battery_derated: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false")
+    # 最近一次功率读数/重分配时刻（演示回放可显式指定读数时间）
+    last_reading_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     # 固定枪口模式：确认时锁定；资源池模式：确认时为空，到站分配
     connector_id: Mapped[int | None] = mapped_column(
         ForeignKey("connectors.id"), nullable=True
@@ -127,6 +164,19 @@ class Reservation(Base):
         order_by="ReservationEvent.id",
     )
     service_actions: Mapped[list["ServiceAction"]] = relationship(
+        back_populates="reservation", cascade="all, delete-orphan"
+    )
+    power_readings: Mapped[list["PowerReading"]] = relationship(
+        back_populates="reservation",
+        cascade="all, delete-orphan",
+        order_by="PowerReading.id",
+    )
+    allocation_logs: Mapped[list["PowerAllocationLog"]] = relationship(
+        back_populates="reservation",
+        cascade="all, delete-orphan",
+        order_by="PowerAllocationLog.id",
+    )
+    ops_cases: Mapped[list["OpsCase"]] = relationship(
         back_populates="reservation", cascade="all, delete-orphan"
     )
 
@@ -184,3 +234,117 @@ class IdempotencyRecord(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime, default=lambda: datetime.now()
     )
+
+
+class SitePowerLimit(Base):
+    """站点级分时变压器上限（功率预算时段）。
+
+    每个时段记录变压器上限；该时段“已确认最低保证合计 / 期望预留合计 /
+    当前已分配合计 / 可接受上浮空间”由预算引擎在此记录基础上实时计算，
+    并通过 /api/sites/{id}/power-board 与预算快照接口给出。
+    限额修订不覆盖旧行：旧时段行保留用于审计与回放，新时段写新行。
+    """
+
+    __tablename__ = "site_power_limits"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    site_id: Mapped[int] = mapped_column(ForeignKey("sites.id"))
+    start_at: Mapped[datetime] = mapped_column(DateTime)
+    end_at: Mapped[datetime] = mapped_column(DateTime)
+    transformer_limit_kw: Mapped[float] = mapped_column(Numeric(8, 2))
+    # 是否为外部电网紧急限额（触发最低保证无法满足时的运营处置）
+    emergency: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false")
+    reason: Mapped[str] = mapped_column(String(255), default="")
+    # 修订来源备注 / 修订批次号（同一次修订产生的多个时段行共用）
+    revision_ref: Mapped[str] = mapped_column(String(40), default="")
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, default=lambda: datetime.now()
+    )
+
+
+class PowerReading(Base):
+    """充电开始后车辆/桩端上报的实时功率回报（约每 5 分钟一条）。"""
+
+    __tablename__ = "power_readings"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    reservation_id: Mapped[int] = mapped_column(ForeignKey("reservations.id"))
+    kind: Mapped[PowerReportKind] = mapped_column(Enum(PowerReportKind))
+    # 车辆当前可接受功率 / BMS 实时上限（kW）
+    current_available_kw: Mapped[float] = mapped_column(Numeric(6, 2))
+    # 桩端实际输出功率（kW），可空
+    actual_power_kw: Mapped[float | None] = mapped_column(Numeric(6, 2), nullable=True)
+    battery_derated: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default="false"
+    )
+    note: Mapped[str] = mapped_column(String(255), default="")
+    # 读数对应的业务时刻；演示回放可显式指定，缺省取服务端当前时间
+    reading_at: Mapped[datetime] = mapped_column(DateTime)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, default=lambda: datetime.now()
+    )
+
+    reservation: Mapped[Reservation] = relationship(back_populates="power_readings")
+
+
+class PowerAllocationLog(Base):
+    """调度器每次分配/重分配后写给司机与运营看的变化与调度依据。"""
+
+    __tablename__ = "power_allocation_logs"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    reservation_id: Mapped[int] = mapped_column(ForeignKey("reservations.id"))
+    # 触发本次分配的来源：CONFIRM / SESSION_START / READING / REALLOCATE /
+    # LIMIT_REVISION / RELEASE
+    trigger: Mapped[str] = mapped_column(String(32))
+    previous_kw: Mapped[float | None] = mapped_column(Numeric(6, 2), nullable=True)
+    allocated_kw: Mapped[float] = mapped_column(Numeric(6, 2))
+    guaranteed_min_kw: Mapped[float] = mapped_column(Numeric(6, 2))
+    expected_kw: Mapped[float] = mapped_column(Numeric(6, 2))
+    # 当时站点变压器上限与预算占用，便于司机理解“为什么是这个功率”
+    site_limit_kw: Mapped[float] = mapped_column(Numeric(8, 2))
+    site_committed_kw: Mapped[float] = mapped_column(Numeric(8, 2))
+    site_remaining_kw: Mapped[float] = mapped_column(Numeric(8, 2))
+    basis: Mapped[str] = mapped_column(Text, default="")
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, default=lambda: datetime.now()
+    )
+
+    reservation: Mapped[Reservation] = relationship(back_populates="allocation_logs")
+
+
+class OpsCase(Base):
+    """运营处置工单：电网紧急限额/预算修订导致具体车辆最低保证受威胁时建单。
+
+    系统绝不把“最低保证已无法满足”的车辆显示为正常：必须存在 OPEN/HANDLING
+    的处置工单，运营端据此逐车处置（限流、改派、补偿等），处置完成才关闭。
+    """
+
+    __tablename__ = "ops_cases"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    site_id: Mapped[int] = mapped_column(ForeignKey("sites.id"))
+    reservation_id: Mapped[int | None] = mapped_column(
+        ForeignKey("reservations.id"), nullable=True
+    )
+    kind: Mapped[OpsCaseKind] = mapped_column(Enum(OpsCaseKind))
+    status: Mapped[OpsCaseStatus] = mapped_column(
+        Enum(OpsCaseStatus),
+        default=OpsCaseStatus.OPEN,
+        server_default=OpsCaseStatus.OPEN.value,
+    )
+    title: Mapped[str] = mapped_column(String(128))
+    # 受影响的具体功率缺口等结构化细节（JSON 字符串）
+    detail: Mapped[str] = mapped_column(Text, default="{}")
+    # 本次事件中该车被保障的最低值与实际可分配值/缺口
+    guaranteed_min_kw: Mapped[float | None] = mapped_column(Numeric(6, 2), nullable=True)
+    allocated_kw: Mapped[float | None] = mapped_column(Numeric(6, 2), nullable=True)
+    shortfall_kw: Mapped[float | None] = mapped_column(Numeric(6, 2), nullable=True)
+    resolution_note: Mapped[str] = mapped_column(Text, default="")
+    handled_by: Mapped[str] = mapped_column(String(64), default="运营值班")
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, default=lambda: datetime.now()
+    )
+    resolved_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+    reservation: Mapped[Reservation | None] = relationship(back_populates="ops_cases")

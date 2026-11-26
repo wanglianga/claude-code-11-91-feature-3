@@ -42,7 +42,7 @@ def _window_end(m: MaintenanceWindow) -> datetime:
 def build_segments(db: Session, site_id: int, ws: datetime, we: datetime) -> list[Segment]:
     """构造 [ws, we) 内功率/占用状态恒定的时间切片。"""
     connectors = db.scalars(
-        select(Connector).where(Connector.site_id == site_id)
+        select(Connector).where(Connector.site_id == site_id).order_by(Connector.id)
     ).all()
     connector_ids = [c.id for c in connectors]
 
@@ -133,7 +133,7 @@ def evaluate_site(
     min_power_kw: float,
 ) -> SiteEval:
     connectors = db.scalars(
-        select(Connector).where(Connector.site_id == site_id)
+        select(Connector).where(Connector.site_id == site_id).order_by(Connector.id)
     ).all()
     segments = build_segments(db, site_id, ws, we)
 

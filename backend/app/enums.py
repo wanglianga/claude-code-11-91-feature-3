@@ -47,3 +47,35 @@ class ImpactDecision(str, enum.Enum):
     NEEDS_RESELECTION = "NEEDS_RESELECTION"      # 进入改选
     MANUAL_CONTACT = "MANUAL_CONTACT"            # 已到站，人工联系
     PROTECTED_CHARGING = "PROTECTED_CHARGING"    # 充电中，受保护不可释放
+
+
+class AllocationPolicy(str, enum.Enum):
+    """站点级功率预算的两种售卖/分配方式。
+
+    - RESERVE_EXPECTED：按每辆车预约时的期望功率为整段预留，稳定可预期，
+      但车辆电池提前降功率后空出的额度不能被后续预约/会话利用。
+    - GUARANTEED_MIN：只把明确承诺的最低保证计入硬占用，剩余预算进入
+      可分配池，按车辆每 5 分钟读数动态重分配，提升同站可接入数量。
+    """
+
+    RESERVE_EXPECTED = "RESERVE_EXPECTED"
+    GUARANTEED_MIN = "GUARANTEED_MIN"
+
+
+class PowerReportKind(str, enum.Enum):
+    """车辆/充电桩上报的实时功率状态。"""
+
+    READING = "READING"                  # 常规 5 分钟读数
+    BATTERY_DERATE = "BATTERY_DERATE"    # 车辆进入电池限功率状态
+
+
+class OpsCaseStatus(str, enum.Enum):
+    OPEN = "OPEN"                # 待运营处置
+    HANDLING = "HANDLING"        # 处置中
+    RESOLVED = "RESOLVED"        # 已处置
+
+
+class OpsCaseKind(str, enum.Enum):
+    GRID_EMERGENCY = "GRID_EMERGENCY"        # 电网紧急限额，最低保证无法全部满足
+    BUDGET_REVISION = "BUDGET_REVISION"      # 站点功率上限修订影响
+    POWER_SHORTFALL = "POWER_SHORTFALL"       # 实时分配低于明确承诺的最低值

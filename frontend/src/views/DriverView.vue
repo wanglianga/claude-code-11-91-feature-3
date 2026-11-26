@@ -31,8 +31,21 @@
       </div>
       <div class="row">
         <label class="field">
-          <span>最低功率 kW</span>
+          <span>最低保证功率 kW</span>
           <input type="number" min="1" v-model.number="form.min_power_kw" />
+        </label>
+        <label class="field">
+          <span>期望功率 kW（上浮目标）</span>
+          <input type="number" min="1" v-model.number="form.expected_power_kw" />
+        </label>
+      </div>
+      <div class="row">
+        <label class="field">
+          <span>站点功率预算方式</span>
+          <select v-model="form.allocation_policy">
+            <option value="GUARANTEED_MIN">仅保证最低值 · 5 分钟动态分配</option>
+            <option value="RESERVE_EXPECTED">按期望功率整段预留</option>
+          </select>
         </label>
         <label class="field">
           <span>预约粒度</span>
@@ -59,6 +72,22 @@
 
       <div v-if="notice" :class="['notice', notice.kind]" style="margin-top:12px">
         {{ notice.text }}
+      </div>
+
+      <div v-if="confirmedView" class="budget-explain">
+        <h3 style="margin:0 0 6px">本单确认依据：单枪限制 × 站点总预算</h3>
+        <p style="margin:0 0 8px">{{ confirmedView.promise }}</p>
+        <div class="chip-row" style="margin:0 0 6px">
+          <span class="badge info">单枪额定 {{ confirmedView.gunRated }}kW</span>
+          <span class="badge info">变压器上限 {{ confirmedView.limit }}kW</span>
+          <span class="badge ok">最低保证 {{ confirmedView.min }}kW</span>
+          <span class="badge warn">期望 {{ confirmedView.expected }}kW</span>
+          <span class="badge muted">{{ policyLabel(confirmedView.policy) }}</span>
+        </div>
+        <div v-for="(s, i) in confirmedView.segments" :key="i" class="seg">
+          {{ fmt(s.start_at) }}–{{ fmt(s.end_at) }}：上限 {{ s.transformer_limit_kw }} /
+          已保证 {{ s.guaranteed_committed_kw }} / 本单后硬占用 {{ s.hard_committed_after_kw }}kW
+        </div>
       </div>
     </section>
 
@@ -118,7 +147,8 @@
         <table v-if="reservations.length">
           <thead>
             <tr>
-              <th>订单</th><th>车辆/粒度</th><th>时间窗</th><th>枪口</th><th>状态</th><th>操作</th>
+              <th>订单</th><th>车辆/粒度</th><th>时间窗</th><th>枪口</th>
+              <th>功率：保证/期望/当前</th><th>状态</th><th>操作</th>
             </tr>
           </thead>
           <tbody>
@@ -136,9 +166,36 @@
                 <span v-if="r.connector_id">{{ gunCode(r.connector_id) }}</span>
                 <span v-else class="muted">到站分配</span>
                 <details>
-                  <summary>确认快照</summary>
+                  <summary>确认快照（含站点预算解释）</summary>
                   <pre class="mono" style="white-space:pre-wrap">{{ pretty(r.confirmation_snapshot) }}</pre>
                 </details>
+              </td>
+              <td>
+                <div style="font-size:12px;line-height:1.7">
+                  <div>保证 <strong>{{ r.min_power_kw }}</strong> kW</div>
+                  <div class="muted">期望 {{ r.expected_power_kw }} kW</div>
+                  <div>
+                    当前分配
+                    <strong :class="r.allocated_power_kw != null ? 'ok-text' : 'muted'">
+                      {{ r.allocated_power_kw ?? '待调度' }}
+                    </strong>
+                  </div>
+                  <div v-if="r.battery_derated">
+                    <span class="badge warn">电池限功率</span>
+                    <span class="muted">车报 {{ r.current_available_power_kw }}kW</span>
+                  </div>
+                  <div v-if="r.allocation_logs && r.allocation_logs.length">
+                    <details>
+                      <summary>功率变化（{{ r.allocation_logs.length }}）</summary>
+                      <ul class="timeline">
+                        <li v-for="l in r.allocation_logs" :key="l.id">
+                          <strong>{{ l.previous_kw != null ? l.previous_kw + ' → ' : '' }}{{ l.allocated_kw }}kW</strong>
+                          <div class="muted" style="font-size:12px">{{ l.basis }}</div>
+                        </li>
+                      </ul>
+                    </details>
+                  </div>
+                </div>
               </td>
               <td><span :class="['badge', statusBadge(r.status)]">{{ STATUS_LABELS[r.status] }}</span></td>
               <td>
@@ -148,6 +205,8 @@
                   <button v-if="r.status === 'CONFIRMED'" class="small ghost" @click="transition(r, 'cancel')">取消并释放</button>
                   <button v-if="r.status === 'CONFIRMED'" class="small ghost" @click="transition(r, 'no-show')">标记迟到</button>
                   <button v-if="r.status === 'CHARGING'" class="small secondary" @click="transition(r, 'complete')">完成充电</button>
+                  <button v-if="r.status === 'CHARGING'" class="small ghost" @click="reportPower(r, 90, false)">报读数 90kW</button>
+                  <button v-if="r.status === 'CHARGING'" class="small ghost" @click="reportPower(r, 60, true)">报电池降额 60kW</button>
                 </div>
                 <details>
                   <summary>事件流（{{ r.events.length }}）</summary>
@@ -181,15 +240,18 @@
 
 <script setup>
 import { onMounted, reactive, ref } from 'vue'
-import { api, MODE_LABELS, newIdempotencyKey, STATUS_LABELS } from '../api.js'
+import { api, MODE_LABELS, newIdempotencyKey, POLICY_LABELS, STATUS_LABELS } from '../api.js'
 
 const vehicles = ref([])
 const sites = ref([])
 const reservations = ref([])
 const searchResult = ref(null)
 const notice = ref(null)
+const confirmedView = ref(null)
 const idemKey = ref(newIdempotencyKey())
 let lastRequest = null
+
+function policyLabel(p) { return POLICY_LABELS[p] || p }
 
 const form = reactive({
   vehicle_id: 1,
@@ -197,6 +259,8 @@ const form = reactive({
   start_at: '2026-11-27T18:00',
   duration_minutes: 10,
   min_power_kw: 90,
+  expected_power_kw: 90,
+  allocation_policy: 'GUARANTEED_MIN',
   mode: 'CONNECTOR',
 })
 
@@ -220,6 +284,8 @@ function payload() {
     start_at: form.start_at + ':00',
     duration_minutes: form.duration_minutes,
     min_power_kw: form.min_power_kw,
+    expected_power_kw: form.expected_power_kw,
+    allocation_policy: form.allocation_policy,
     mode: form.mode,
   }
 }
@@ -239,6 +305,17 @@ async function confirmBook() {
   lastRequest = body
   try {
     const r = await api.post('/api/reservations', body)
+    let snap = {}
+    try { snap = JSON.parse(r.confirmation_snapshot) } catch { /* ignore */ }
+    confirmedView.value = {
+      promise: snap.promise || '',
+      gunRated: snap.connector_rated_power_kw ?? '—',
+      limit: snap.site_transformer_limit_kw ?? '—',
+      min: r.min_power_kw,
+      expected: r.expected_power_kw,
+      policy: r.allocation_policy,
+      segments: snap.power_budget?.segments || [],
+    }
     notice.value = {
       kind: 'ok',
       text: r.mode === 'POOL'
@@ -248,6 +325,7 @@ async function confirmBook() {
     searchResult.value = null
     await loadReservations()
   } catch (e) {
+    confirmedView.value = null
     notice.value = { kind: 'bad', text: '确认被拒绝：' + e.message }
   }
 }
@@ -277,6 +355,28 @@ async function transition(r, action) {
     await api.post(`/api/reservations/${r.id}/${action}`, {
       idempotency_key: newIdempotencyKey(),
     })
+    await loadReservations()
+  } catch (e) {
+    notice.value = { kind: 'bad', text: e.message }
+  }
+}
+
+async function reportPower(r, kw, derated) {
+  notice.value = null
+  try {
+    await api.post(`/api/reservations/${r.id}/power-reading`, {
+      current_available_kw: kw,
+      actual_power_kw: kw,
+      battery_derated: derated,
+      note: derated ? '司机端上报电池限功率' : '司机端周期读数',
+      idempotency_key: newIdempotencyKey(),
+    })
+    notice.value = {
+      kind: 'ok',
+      text: derated
+        ? `已上报电池降额（最多接受 ${kw}kW），释放的预算可分配给其他会话`
+        : `已上报当前可接受功率 ${kw}kW，并完成动态重分配`,
+    }
     await loadReservations()
   } catch (e) {
     notice.value = { kind: 'bad', text: e.message }

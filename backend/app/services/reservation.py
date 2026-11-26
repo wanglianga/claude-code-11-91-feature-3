@@ -15,14 +15,12 @@ from fastapi import HTTPException
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
-from ..enums import ReservationMode, ReservationStatus
+from ..enums import AllocationPolicy, ReservationMode, ReservationStatus
 from ..models import Reservation, ReservationEvent, Site, Vehicle
 from ..schemas import ConfirmRequest
 from .capacity import evaluate_site, find_connector_eval
-
-# 咨询锁命名空间（固定常量 + 站点 id / 预约 id）
-LOCK_NS_SITE = 91001
-LOCK_NS_RESERVATION = 91002
+from .common import LOCK_NS_RESERVATION, LOCK_NS_SITE
+from .power import assert_confirm_budget
 
 
 def _body_hash(payload: dict) -> str:
@@ -47,6 +45,17 @@ def _new_ref() -> str:
     return f"R-{uuid4().hex[:8].upper()}"
 
 
+def _promise_text(code, gun_power, site, policy, min_kw, expected_kw) -> str:
+    if policy == AllocationPolicy.RESERVE_EXPECTED:
+        budget_rule = f"按期望 {expected_kw:g}kW 为整段预留站点预算"
+    else:
+        budget_rule = f"仅硬承诺最低 {min_kw:g}kW，剩余预算按 5 分钟读数动态分配"
+    return (
+        f"锁定枪口 {code}，单枪窗内有效功率不低于 {gun_power:g}kW；"
+        f"同时受站点变压器上限 {float(site.transformer_limit_kw):g}kW 总预算约束，{budget_rule}"
+    )
+
+
 # ---------- 确认 ----------
 
 def confirm_reservation(db: Session, req: ConfirmRequest) -> Reservation:
@@ -66,6 +75,26 @@ def confirm_reservation(db: Session, req: ConfirmRequest) -> Reservation:
     db.execute(
         text("SELECT pg_advisory_xact_lock(:ns, :sid)"),
         {"ns": LOCK_NS_SITE, "sid": site.id},
+    )
+
+    # 期望功率与预算策略：请求可显式指定（用于两种分配方式回放），
+    # 否则期望=最低值、策略取站点当前策略。
+    expected_kw = (
+        float(req.expected_power_kw)
+        if getattr(req, "expected_power_kw", None) is not None
+        else float(req.min_power_kw)
+    )
+    if expected_kw + 1e-9 < float(req.min_power_kw):
+        raise HTTPException(422, "期望功率不能低于明确承诺的最低功率")
+    policy = (
+        req.allocation_policy
+        if getattr(req, "allocation_policy", None) is not None
+        else site.allocation_policy
+    )
+
+    # 站点级分时功率预算校验：即使每支枪都空闲，也不能把变压器总容量超卖。
+    budget_summary = assert_confirm_budget(
+        db, site, start, end, float(req.min_power_kw), expected_kw, policy
     )
 
     evaluation = evaluate_site(db, site.id, vehicle, start, end, req.min_power_kw)
@@ -106,10 +135,16 @@ def confirm_reservation(db: Session, req: ConfirmRequest) -> Reservation:
             "connector_id": chosen.connector.id,
             "connector_code": chosen.connector.code,
             "connector_type": chosen.connector.connector_type,
+            "connector_rated_power_kw": float(chosen.connector.rated_power_kw),
             "min_power_kw": req.min_power_kw,
+            "expected_power_kw": expected_kw,
+            "allocation_policy": policy.value,
+            "site_transformer_limit_kw": float(site.transformer_limit_kw),
+            "power_budget": budget_summary,
             "effective_power_kw": chosen.min_power,
             "accessible": chosen.connector.accessible,
-            "promise": f"锁定枪口 {chosen.connector.code}，全程有效功率不低于 {chosen.min_power:g}kW",
+            "promise": _promise_text(chosen.connector.code, chosen.min_power,
+                                     site, policy, req.min_power_kw, expected_kw),
         }
     else:
         if evaluation.confirmable_pool_slots < 1:
@@ -130,11 +165,19 @@ def confirm_reservation(db: Session, req: ConfirmRequest) -> Reservation:
             "connector_code": None,
             "connector_type": vehicle.connector_type,
             "min_power_kw": req.min_power_kw,
+            "expected_power_kw": expected_kw,
+            "allocation_policy": policy.value,
+            "site_transformer_limit_kw": float(site.transformer_limit_kw),
+            "power_budget": budget_summary,
             "accessible_required": vehicle.accessible,
             "confirmable_slots_at_booking": evaluation.confirmable_pool_slots,
             "promise": (
                 f"站点资源池名额 1 个（当时池内可同时履约名额 "
-                f"{evaluation.confirmable_pool_slots}），到站再分配具体枪口"
+                f"{evaluation.confirmable_pool_slots}），到站再分配具体枪口；"
+                f"站点变压器上限 {float(site.transformer_limit_kw):g}kW，"
+                + (f"按期望 {expected_kw:g}kW 整段预留预算"
+                   if policy == AllocationPolicy.RESERVE_EXPECTED
+                   else f"硬承诺最低 {req.min_power_kw:g}kW，余量动态分配")
             ),
         }
 
@@ -147,6 +190,8 @@ def confirm_reservation(db: Session, req: ConfirmRequest) -> Reservation:
         start_at=start,
         end_at=end,
         min_power_kw=req.min_power_kw,
+        expected_power_kw=expected_kw,
+        allocation_policy=policy,
         connector_id=connector_id,
         confirmation_snapshot=json.dumps(snapshot, ensure_ascii=False, default=str),
     )
@@ -248,7 +293,17 @@ def start_charging(db: Session, reservation_id: int) -> Reservation:
         if r.connector_id is None:
             raise HTTPException(409, "资源池预约尚未分配枪口，无法开始充电")
         r.status = ReservationStatus.CHARGING
-        _add_event(db, r, "CHARGING_STARTED", {"connector_id": r.connector_id})
+        # 初始分配不低于明确承诺的最低值；随后由车辆 5 分钟读数驱动动态重分配。
+        if r.allocated_power_kw is None:
+            r.allocated_power_kw = r.min_power_kw
+        _add_event(db, r, "CHARGING_STARTED", {
+            "connector_id": r.connector_id,
+            "initial_allocated_kw": float(r.allocated_power_kw),
+            "guaranteed_min_kw": float(r.min_power_kw),
+        })
+        # 以预约时段起点作为确定性回放时刻做一次全站分配（同事务咨询锁可重入）
+        from .power import reallocate
+        reallocate(db, r.site_id, r.start_at, trigger="SESSION_START", focus_id=r.id)
     return _transition(db, reservation_id, "start_charging", build)
 
 

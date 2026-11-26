@@ -206,3 +206,15 @@ details summary { cursor: pointer; color: var(--brand); font-weight: 600; }
   margin-bottom: 12px;
 }
 .pool-hero .big { font-size: 26px; font-weight: 800; color: var(--brand); }
+
+.ok-text { color: var(--ok); font-weight: 700; }
+.bad-text { color: var(--bad); font-weight: 700; }
+
+.budget-explain {
+  margin-top: 12px;
+  border: 1px solid #9ed3b3;
+  background: #f6fcf8;
+  border-radius: 8px;
+  padding: 12px 14px;
+  font-size: 13px;
+}

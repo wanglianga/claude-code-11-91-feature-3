@@ -8,13 +8,14 @@ import json
 from datetime import datetime
 
 from .database import engine, SessionLocal
-from .enums import ReservationMode, ReservationStatus
+from .enums import AllocationPolicy, ReservationMode, ReservationStatus
 from .models import (
     Base,
     Connector,
     Reservation,
     ReservationEvent,
     Site,
+    SitePowerLimit,
     Vehicle,
 )
 
@@ -49,11 +50,31 @@ def seed() -> None:
             name="沪D·44444 长续航 SUV（请求 90kW 的第二位车主）",
             connector_type="CCS", max_power_kw=150, accessible=False,
         )
-        db.add_all([v1, v2, v3, v4])
+        # 题面功率预算场景三辆车：均保证至少 60kW、希望达到 90kW
+        r1 = Vehicle(
+            name="R1 网约车（保证 60 / 期望 90，稍后电池限功率）",
+            connector_type="CCS", max_power_kw=120, accessible=False,
+        )
+        r2 = Vehicle(
+            name="R2 出租车（保证 60 / 期望 90）",
+            connector_type="CCS", max_power_kw=120, accessible=False,
+        )
+        r3 = Vehicle(
+            name="R3 私家车（保证 60 / 期望 90）",
+            connector_type="CCS", max_power_kw=120, accessible=False,
+        )
+        db.add_all([v1, v2, v3, v4, r1, r2, r3])
         db.flush()
 
         # ---------- 站点与枪口 ----------
-        site = Site(name="东站充电站", location="东站地下停车场 B1 层西侧")
+        # 东站保留原 16 项场景：四枪额定合计 420kW，变压器给 360kW，
+        # 使既有“枪口兼容性/维护”回放不被站点预算干扰。
+        site = Site(
+            name="东站充电站",
+            location="东站地下停车场 B1 层西侧",
+            transformer_limit_kw=360,
+            allocation_policy=AllocationPolicy.GUARANTEED_MIN,
+        )
         db.add(site)
         db.flush()
 
@@ -105,13 +126,54 @@ def seed() -> None:
             event_type="CONFIRMED",
             detail=json.dumps({"snapshot": snapshot}, ensure_ascii=False),
         ))
+
+        # ---------- 题面：180kW 变压器 + 三支均兼容的枪 ----------
+        power_site = Site(
+            name="临港 P3 功率预算示范站",
+            location="临港产业园 P3 停车场（3 支 CCS 兼容枪，变压器上限 180kW）",
+            transformer_limit_kw=180,
+            # 默认最低保证模式；两种方式都可在回放时按请求显式指定/切换
+            allocation_policy=AllocationPolicy.GUARANTEED_MIN,
+        )
+        db.add(power_site)
+        db.flush()
+
+        power_guns = [
+            Connector(site_id=power_site.id, code="P1", connector_type="CCS",
+                      rated_power_kw=120, accessible=False,
+                      position_note="P3 区 1 号，CCS 直流双枪之一"),
+            Connector(site_id=power_site.id, code="P2", connector_type="CCS",
+                      rated_power_kw=120, accessible=False,
+                      position_note="P3 区 2 号，CCS 直流双枪之二"),
+            Connector(site_id=power_site.id, code="P3", connector_type="CCS",
+                      rated_power_kw=120, accessible=False,
+                      position_note="P3 区 3 号，CCS 直流桩"),
+        ]
+        db.add_all(power_guns)
+        db.flush()
+
+        # 晚高峰分时预算时段：17:30–21:00 变压器上限 180kW（题面基准）
+        db.add(SitePowerLimit(
+            site_id=power_site.id,
+            start_at=datetime.fromisoformat(f"{FRIDAY}T17:30:00"),
+            end_at=datetime.fromisoformat(f"{FRIDAY}T21:00:00"),
+            transformer_limit_kw=180,
+            emergency=False,
+            reason="晚高峰计划限额：配电变压器上限 180kW",
+            revision_ref="SEED-BASE",
+        ))
+
         db.commit()
 
         print("种子数据完成：")
-        print(f"  站点: {site.name}（id={site.id}），枪口 A/B=120kW CCS，C=60kW CCS，D=120kW CHAdeMO")
-        print(f"  车辆: V1 120kW / V2 60kW / V3 无障碍 100kW / V4 150kW（均为 CCS）")
-        print(f"  预约: {existing.ref} 锁定 A 枪 {FRIDAY} 18:00-18:30")
-        print("  => 18:00-18:10 的 90kW 请求：B 是唯一剩余合格容量")
+        print(f"  站点1: {site.name}（id={site.id}，变压器 {float(site.transformer_limit_kw):g}kW），"
+              "枪口 A/B=120kW CCS，C=60kW CCS，D=120kW CHAdeMO")
+        print(f"  车辆 V1..V4：原维护/容量场景；预约 {existing.ref} 锁定 A 枪 {FRIDAY} 18:00-18:30")
+        print(f"  站点2: {power_site.name}（id={power_site.id}，变压器 180kW），P1/P2/P3 三支 CCS 120kW 全兼容")
+        print("  车辆 R1/R2/R3（id=5/6/7）：CCS 120kW，保证≥60、期望 90")
+        print("  => 期望预留模式：2 辆×90 占满 180，第 3 辆无法确认")
+        print("  => 最低保证模式：3 辆×60 正好 180，均可确认")
+        print("  => 18:00-18:10 的 90kW 请求：B 是东站唯一剩余合格容量")
     finally:
         db.close()
 

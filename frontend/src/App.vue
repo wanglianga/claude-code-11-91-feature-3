@@ -4,6 +4,7 @@
     <nav>
       <RouterLink to="/driver">司机端</RouterLink>
       <RouterLink to="/operations">运营端</RouterLink>
+      <RouterLink to="/power-lab">功率预算回放</RouterLink>
     </nav>
   </header>
   <main>

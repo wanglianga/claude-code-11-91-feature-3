@@ -54,7 +54,9 @@ def idempotent_endpoint(
         code = 200
     except HTTPException as exc:
         code = exc.status_code
-        body = {"detail": exc.detail}
+        # 结构化 detail 可能含 datetime/Enum，统一编码为 JSON 安全对象，
+        # 这样随后抛出的 IdempotentConflict.body 可直接交给 JSONResponse。
+        body = jsonable_encoder({"detail": exc.detail})
 
     db.add(IdempotencyRecord(
         idempotency_key=key,

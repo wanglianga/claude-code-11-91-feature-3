@@ -1,4 +1,51 @@
 <template>
+  <div class="stack">
+    <!-- 站点级功率预算与电网紧急限额处置 -->
+    <section class="panel">
+      <h2>⚡ 站点分时功率预算 · 当前分配与紧急处置
+        <RouterLink to="/power-lab" class="small" style="float:right;font-weight:600">
+          前往两种分配方式一键回放台 →
+        </RouterLink>
+      </h2>
+      <div class="row" style="align-items:flex-end;margin-bottom:6px">
+        <label class="field" style="margin-bottom:0;max-width:300px">
+          <span>站点</span>
+          <select v-model.number="powerSiteId" @change="powerBoard?.load()">
+            <option v-for="s in sites" :key="s.id" :value="s.id">
+              {{ s.name }}（变压器 {{ s.transformer_limit_kw }}kW / {{ policyLabel(s.allocation_policy) }}）
+            </option>
+          </select>
+        </label>
+        <label class="field" style="margin-bottom:0;max-width:230px">
+          <span>面板时刻</span>
+          <input type="datetime-local" v-model="powerAt" @change="powerBoard?.load()" />
+        </label>
+        <button class="secondary" style="max-width:140px" @click="powerBoard?.load(); loadOpsCases()">刷新</button>
+      </div>
+      <PowerBoard ref="powerBoard" :site-id="powerSiteId" :at="powerAt" />
+
+      <h3>电网紧急限额 / 预算缺额处置工单（{{ opsCases.length }}）</h3>
+      <table v-if="opsCases.length">
+        <thead><tr><th>#</th><th>标题</th><th>缺口</th><th>状态</th><th>处置</th></tr></thead>
+        <tbody>
+          <tr v-for="c in opsCases" :key="c.id">
+            <td>{{ c.id }}</td>
+            <td>{{ c.title }}<div class="muted" style="font-size:12px">{{ caseKindLabel(c.kind) }}</div></td>
+            <td class="mono bad">{{ c.shortfall_kw ?? '—' }}kW</td>
+            <td><span :class="['badge', c.status === 'RESOLVED' ? 'ok' : 'bad']">{{ caseStatusLabel(c.status) }}</span></td>
+            <td>
+              <template v-if="c.status !== 'RESOLVED'">
+                <input v-model="opsNotes[c.id]" placeholder="处置说明：限流/改派/补偿" />
+                <button class="small secondary" style="margin-top:4px" @click="resolveOps(c)">确认处置</button>
+              </template>
+              <span v-else class="muted">{{ c.resolution_note }}</span>
+            </td>
+          </tr>
+        </tbody>
+      </table>
+      <p v-else class="muted">暂无功率类处置工单：所有活动会话的明确最低保证都在站点预算内。</p>
+    </section>
+
   <div class="grid two">
     <!-- 左：维护操作 -->
     <section class="stack">
@@ -182,11 +229,16 @@
       </div>
     </section>
   </div>
+  </div>
 </template>
 
 <script setup>
 import { onMounted, reactive, ref, computed } from 'vue'
-import { api, IMPACT_LABELS, MODE_LABELS, newIdempotencyKey, STATUS_LABELS } from '../api.js'
+import {
+  api, IMPACT_LABELS, MODE_LABELS, newIdempotencyKey, STATUS_LABELS,
+  POLICY_LABELS, CASE_KIND_LABELS, CASE_STATUS_LABELS,
+} from '../api.js'
+import PowerBoard from '../components/PowerBoard.vue'
 
 const sites = ref([])
 const reservations = ref([])
@@ -194,6 +246,40 @@ const windows = ref([])
 const lastImpact = ref(null)
 const notice = ref(null)
 const recoverAt = reactive({})
+
+// 站点功率预算 / 紧急处置
+const powerSiteId = ref(2)
+const powerAt = ref('2026-11-27T18:10')
+const powerBoard = ref(null)
+const opsCases = ref([])
+const opsNotes = reactive({})
+
+function policyLabel(p) { return POLICY_LABELS[p] || p }
+function caseKindLabel(k) { return CASE_KIND_LABELS[k] || k }
+function caseStatusLabel(s) { return CASE_STATUS_LABELS[s] || s }
+
+async function loadOpsCases() {
+  opsCases.value = await api.get('/api/operations/ops-cases')
+}
+
+async function resolveOps(c) {
+  const note = (opsNotes[c.id] || '').trim()
+  if (!note) {
+    notice.value = { kind: 'warn', text: '请先填写处置说明' }
+    return
+  }
+  try {
+    await api.post(`/api/operations/ops-cases/${c.id}/resolve`, {
+      resolution_note: note,
+      idempotency_key: newIdempotencyKey(),
+    })
+    notice.value = { kind: 'ok', text: `处置工单 #${c.id} 已关闭` }
+    await loadOpsCases()
+    powerBoard.value?.load()
+  } catch (e) {
+    notice.value = { kind: 'bad', text: e.message }
+  }
+}
 
 const mw = reactive({
   connector_id: 2,
@@ -219,6 +305,7 @@ async function loadAll() {
   sites.value = await api.get('/api/sites')
   reservations.value = await api.get('/api/reservations')
   windows.value = await api.get('/api/maintenance')
+  await loadOpsCases()
   for (const w of windows.value) {
     if (!recoverAt[w.id]) recoverAt[w.id] = w.planned_end_at.slice(0, 16)
   }

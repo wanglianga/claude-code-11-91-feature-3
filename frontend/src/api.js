@@ -52,3 +52,24 @@ export const IMPACT_LABELS = {
   MANUAL_CONTACT: '人工联系',
   PROTECTED_CHARGING: '充电中受保护',
 }
+
+export const POLICY_LABELS = {
+  RESERVE_EXPECTED: '按期望整段预留',
+  GUARANTEED_MIN: '仅保证最低值 · 5 分钟动态分配',
+}
+
+export const CASE_STATUS_LABELS = {
+  OPEN: '待处置',
+  HANDLING: '处置中',
+  RESOLVED: '已处置',
+}
+
+export const CASE_KIND_LABELS = {
+  GRID_EMERGENCY: '电网紧急限额',
+  BUDGET_REVISION: '预算修订',
+  POWER_SHORTFALL: '功率缺额',
+}
+
+export function fmtTime(t) {
+  return t ? t.replace('T', ' ').slice(5, 16) : ''
+}

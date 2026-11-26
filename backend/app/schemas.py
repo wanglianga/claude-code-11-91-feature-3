@@ -5,8 +5,11 @@ from typing import Annotated
 from pydantic import BaseModel, ConfigDict, Field, PlainSerializer
 
 from .enums import (
+    AllocationPolicy,
     ImpactDecision,
     MaintenanceKind,
+    OpsCaseKind,
+    OpsCaseStatus,
     ReservationMode,
     ReservationStatus,
     ServiceActionKind,
@@ -46,6 +49,8 @@ class SiteOut(ORMModel):
     id: int
     name: str
     location: str
+    transformer_limit_kw: DecimalNum = 180
+    allocation_policy: AllocationPolicy = AllocationPolicy.GUARANTEED_MIN
     connectors: list[ConnectorOut]
 
 
@@ -100,6 +105,10 @@ class ConfirmRequest(BaseModel):
     start_at: datetime
     duration_minutes: int = Field(gt=0, le=600)
     min_power_kw: float = Field(gt=0)
+    # 期望（希望达到）功率；不传时等于最低功率。题面 R1/R2/R3：最低 60、期望 90。
+    expected_power_kw: float | None = Field(default=None, gt=0)
+    # 本次确认采用的预算策略；不传则取站点当前策略。
+    allocation_policy: AllocationPolicy | None = None
     mode: ReservationMode = ReservationMode.CONNECTOR
     # 固定枪口模式可指定偏好枪口；为空时由后端选择一支合格枪并锁住
     preferred_connector_id: int | None = None
@@ -124,6 +133,20 @@ class ServiceActionOut(ORMModel):
     created_at: datetime
 
 
+class PowerAllocationLogOut(ORMModel):
+    id: int
+    trigger: str
+    previous_kw: DecimalNum | None
+    allocated_kw: DecimalNum
+    guaranteed_min_kw: DecimalNum
+    expected_kw: DecimalNum
+    site_limit_kw: DecimalNum
+    site_committed_kw: DecimalNum
+    site_remaining_kw: DecimalNum
+    basis: str
+    created_at: datetime
+
+
 class ReservationOut(ORMModel):
     id: int
     ref: str
@@ -134,11 +157,18 @@ class ReservationOut(ORMModel):
     start_at: datetime
     end_at: datetime
     min_power_kw: DecimalNum
+    expected_power_kw: DecimalNum = 90
+    allocation_policy: AllocationPolicy = AllocationPolicy.GUARANTEED_MIN
+    allocated_power_kw: DecimalNum | None = None
+    current_available_power_kw: DecimalNum | None = None
+    battery_derated: bool = False
+    last_reading_at: datetime | None = None
     connector_id: int | None
     confirmation_snapshot: str
     created_at: datetime
     events: list[ReservationEventOut] = []
     service_actions: list[ServiceActionOut] = []
+    allocation_logs: list[PowerAllocationLogOut] = []
 
 
 class TransitionRequest(BaseModel):
@@ -198,4 +228,73 @@ class ServiceActionCreate(BaseModel):
     target_connector_id: int | None = None
     amount: float | None = None
     note: str = ""
+    idempotency_key: str = Field(min_length=8, max_length=64)
+
+
+# ---------- 站点功率预算 / 实时分配 ----------
+
+class PowerReadingCreate(BaseModel):
+    # 车辆当前可接受功率（BMS 实时上限），开始充电后上报
+    current_available_kw: float = Field(gt=0)
+    actual_power_kw: float | None = Field(default=None, ge=0)
+    battery_derated: bool = False
+    note: str = ""
+    # 演示回放可显式指定读数业务时刻；不传取服务端当前时间
+    reading_at: datetime | None = None
+    idempotency_key: str = Field(min_length=8, max_length=64)
+
+
+class ReallocateRequest(BaseModel):
+    at: datetime
+    idempotency_key: str = Field(min_length=8, max_length=64)
+
+
+class SitePolicyUpdate(BaseModel):
+    allocation_policy: AllocationPolicy
+    transformer_limit_kw: float | None = Field(default=None, gt=0)
+
+
+class PowerLimitCreate(BaseModel):
+    site_id: int
+    start_at: datetime
+    end_at: datetime
+    transformer_limit_kw: float = Field(gt=0)
+    emergency: bool = False
+    reason: str = ""
+    # 修订后立即重分配所使用的时刻；不传用 start_at
+    reallocate_at: datetime | None = None
+    idempotency_key: str = Field(min_length=8, max_length=64)
+
+
+class PowerLimitOut(ORMModel):
+    id: int
+    site_id: int
+    start_at: datetime
+    end_at: datetime
+    transformer_limit_kw: DecimalNum
+    emergency: bool
+    reason: str
+    revision_ref: str
+    created_at: datetime
+
+
+class OpsCaseOut(ORMModel):
+    id: int
+    site_id: int
+    reservation_id: int | None
+    kind: OpsCaseKind
+    status: OpsCaseStatus
+    title: str
+    detail: str
+    guaranteed_min_kw: DecimalNum | None
+    allocated_kw: DecimalNum | None
+    shortfall_kw: DecimalNum | None
+    resolution_note: str
+    handled_by: str
+    created_at: datetime
+    resolved_at: datetime | None
+
+
+class OpsCaseResolve(BaseModel):
+    resolution_note: str = Field(min_length=1)
     idempotency_key: str = Field(min_length=8, max_length=64)

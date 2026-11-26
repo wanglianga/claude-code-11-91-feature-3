@@ -28,6 +28,9 @@ def db():
         yield session
     finally:
         session.close()
+        # 重建过表结构：释放连接池，避免 psycopg 跨测试复用旧的预编译计划
+        # （cached plan must not change result type）。
+        engine.dispose()
 
 
 @pytest.fixture()
@@ -37,6 +40,7 @@ def client():
     seed()
     with TestClient(app) as c:
         yield c
+    engine.dispose()
 
 
 FRIDAY = "2026-11-27"
